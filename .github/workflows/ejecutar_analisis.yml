@@ -1,0 +1,43 @@
+name: Ejecutar Análisis Deportivo - API-Football v3
+
+on:
+  workflow_dispatch:
+    inputs:
+      fecha_manual:
+        description: 'Fecha opcional YYYY-MM-DD (dejar vacío para usar hoy UTC)'
+        required: false
+        default: ''
+  schedule:
+    - cron: '0 6 * * *'
+
+jobs:
+  analizar:
+    name: Motor de Análisis
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias desde requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ejecutar analizador.py con API Key
+        env:
+          APIFOOTBALL_KEY: ${{ secrets.APIFOOTBALL_KEY }}
+        run: python analizador.py
+
+      - name: Subir artefacto JSON resultante
+        uses: actions/upload-artifact@v4
+        with:
+          name: top-partidos-hoy-json
+          path: top_partidos_hoy.json
+          retention-days: 7
