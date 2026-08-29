@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Motor de Análisis Deportivo - TheStats API v1.0.0
-Versión corregida: Rate limiter proactivo + manejo robusto de None
+Versión 3: Rate limiter adaptativo + caché LRU + manejo robusto de None
 """
 
 import os
@@ -10,9 +10,9 @@ import sys
 import json
 import time
 import logging
+import functools
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Set
-from functools import wraps
 
 import requests
 import numpy as np
@@ -51,10 +51,6 @@ UMBRALES_CORNERS = [2.5, 3.5, 4.5, 5.5, 6.5]
 UMBRALES_REMATES_ARCO = [2.5, 3.5, 4.5, 5.5]
 UMBRALES_GOLES_TOTALES = [1.5, 2.5, 3.5]
 
-# Rate limiter proactivo: máximo 1 petición cada 0.6s (~100/minuto)
-MIN_SEGUNDOS_ENTRE_CALLS = 0.6
-_ULTIMA_LLAMADA = [0.0]
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -63,34 +59,110 @@ logging.basicConfig(
 
 
 # ─────────────────────────────────────────────────────────────
-# CAPA DE COMUNICACIÓN HTTP CON RATE LIMITER PROACTIVO
+# RATE LIMITER ADAPTATIVO INTELIGENTE
 # ─────────────────────────────────────────────────────────────
 
-def _rate_limit():
-    """Espera activa para no exceder el límite de tasa de la API."""
-    ahora = time.time()
-    transcurrido = ahora - _ULTIMA_LLAMADA[0]
-    if transcurrido < MIN_SEGUNDOS_ENTRE_CALLS:
-        sleep_time = MIN_SEGUNDOS_ENTRE_CALLS - transcurrido
-        time.sleep(sleep_time)
-    _ULTIMA_LLAMADA[0] = time.time()
+class AdaptiveRateLimiter:
+    """
+    Controla la frecuencia de llamadas leyendo los headers de rate limit
+    de la API y aplicando backoff proactivo antes de agotar la cuota.
+    """
+    def __init__(self, min_interval: float = 1.0):
+        self.min_interval = min_interval
+        self.last_call_ts = 0.0
+        self.remaining: Optional[int] = None
+        self.reset_ts: Optional[float] = None
 
+    def _sleep(self, seconds: float):
+        if seconds > 0:
+            time.sleep(seconds)
+
+    def pre_call(self):
+        """Espera el intervalo mínimo entre llamadas consecutivas."""
+        now = time.time()
+        elapsed = now - self.last_call_ts
+        if elapsed < self.min_interval:
+            self._sleep(self.min_interval - elapsed)
+
+    def post_call(self, response: requests.Response):
+        """
+        Procesa los headers de rate limit de la respuesta para ajustar
+        la velocidad de las siguientes llamadas.
+        """
+        # Headers estándar de rate limiting
+        remaining_hdr = response.headers.get("X-RateLimit-Remaining")
+        reset_hdr = response.headers.get("X-RateLimit-Reset")
+
+        if remaining_hdr is not None:
+            try:
+                self.remaining = int(remaining_hdr)
+            except ValueError:
+                pass
+
+        if reset_hdr is not None:
+            try:
+                val = int(reset_hdr)
+                if val > 1_000_000_000:
+                    # Es un timestamp Unix absoluto
+                    self.reset_ts = float(val)
+                else:
+                    # Es segundos relativos hasta el reset
+                    self.reset_ts = time.time() + val
+            except ValueError:
+                pass
+
+        # Si quedan <= 3 llamadas antes del reset, distribuir el tiempo restante
+        if self.remaining is not None and self.remaining <= 3 and self.reset_ts is not None:
+            now = time.time()
+            time_to_reset = self.reset_ts - now
+            if time_to_reset > 0 and self.remaining > 0:
+                adaptive_sleep = time_to_reset / self.remaining
+                logging.info(
+                    f"Rate limit adaptativo: {self.remaining} restantes, "
+                    f"reset en {time_to_reset:.0f}s, espera {adaptive_sleep:.2f}s"
+                )
+                self._sleep(adaptive_sleep)
+
+        self.last_call_ts = time.time()
+
+    def handle_429(self, response: requests.Response):
+        """Espera el tiempo indicado por Retry-After o un fallback seguro."""
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                wait = int(retry_after)
+            except ValueError:
+                wait = 5
+        else:
+            wait = 5
+        logging.warning(f"HTTP 429 recibido. Retry-After={wait}s. Pausando...")
+        self._sleep(wait)
+        self.last_call_ts = time.time()
+
+
+_LIMITER = AdaptiveRateLimiter(min_interval=1.0)
+
+
+# ─────────────────────────────────────────────────────────────
+# CAPA DE COMUNICACIÓN HTTP
+# ─────────────────────────────────────────────────────────────
 
 def api_get(endpoint: str, params: Dict[str, Any] = None, max_retries: int = 3) -> Dict[str, Any]:
     """
-    Ejecuta una petición GET autenticada a TheStats API con rate limiter
-    proactivo y reintentos exponenciales ante 429.
+    Ejecuta una petición GET autenticada con rate limiter adaptativo
+    y reintentos ante 429.
     """
     url = f"{BASE_URL}{endpoint}"
     for intento in range(1, max_retries + 1):
         try:
-            _rate_limit()
+            _LIMITER.pre_call()
             resp = requests.get(url, headers=HEADERS, params=params, timeout=30)
+            _LIMITER.post_call(resp)
+
             if resp.status_code == 429:
-                espera = 2 ** intento
-                logging.warning(f"Rate limit 429 en {url}. Backoff {espera}s (intento {intento})")
-                time.sleep(espera)
+                _LIMITER.handle_429(resp)
                 continue
+
             resp.raise_for_status()
             data = resp.json()
             if "error" in data:
@@ -106,9 +178,7 @@ def api_get(endpoint: str, params: Dict[str, Any] = None, max_retries: int = 3) 
 
 
 def api_get_all_pages(endpoint: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Itera automáticamente todas las páginas de una respuesta paginada.
-    """
+    """Itera automáticamente todas las páginas de una respuesta paginada."""
     todos = []
     pagina = 1
     while True:
@@ -130,10 +200,7 @@ def api_get_all_pages(endpoint: str, params: Dict[str, Any]) -> List[Dict[str, A
 # ─────────────────────────────────────────────────────────────
 
 def resolver_ids_competiciones() -> Set[str]:
-    """
-    Consulta /football/competitions y resuelve dinámicamente los IDs
-    de las ligas élite por nombre exacto o parcial.
-    """
+    """Resuelve dinámicamente los IDs de las ligas élite."""
     logging.info("Resolviendo IDs de competiciones élite...")
     competiciones = api_get_all_pages("/football/competitions", {})
     ids = set()
@@ -152,35 +219,32 @@ def resolver_ids_competiciones() -> Set[str]:
 
 
 # ─────────────────────────────────────────────────────────────
-# EXTRACTORES DE DATOS REALES
+# EXTRACTORES DE DATOS REALES (CON CACHÉ LRU)
 # ─────────────────────────────────────────────────────────────
 
 def obtener_partidos_del_dia(fecha_str: str, ids_ligas: Set[str]) -> List[Dict[str, Any]]:
-    """
-    Consulta /football/matches filtrando por fecha y status=scheduled.
-    """
+    """Consulta partidos scheduled del día filtrando por ligas élite."""
     partidos = api_get_all_pages("/football/matches", {
         "date_from": fecha_str,
         "date_to": fecha_str,
         "status": "scheduled"
     })
-    filtrados = [p for p in partidos if p.get("competition_id") in ids_ligas]
-    return filtrados[:MAX_PARTIDOS_DIA]
+    return [p for p in partidos if p.get("competition_id") in ids_ligas][:MAX_PARTIDOS_DIA]
 
 
 def obtener_ultimos_partidos_equipo(team_id: str, es_local: bool, fecha_hasta: str) -> List[Dict[str, Any]]:
     """
-    Consulta /football/matches?team_id={id}&status=finished&date_to={fecha}.
-    Filtra los últimos 10 partidos finalizados según condición local/visitante.
+    Consulta partidos finished de un equipo y filtra por condición
+    local/visitante. Devuelve los últimos 10.
     """
     partidos = api_get_all_pages("/football/matches", {
         "team_id": team_id,
         "status": "finished",
         "date_to": fecha_hasta
     })
-    partidos_ordenados = sorted(partidos, key=lambda x: x.get("utc_date", ""), reverse=True)
+    ordenados = sorted(partidos, key=lambda x: x.get("utc_date", ""), reverse=True)
     filtrados = []
-    for p in partidos_ordenados:
+    for p in ordenados:
         if es_local and p.get("home_team", {}).get("id") == team_id:
             filtrados.append(p)
         elif not es_local and p.get("away_team", {}).get("id") == team_id:
@@ -188,9 +252,11 @@ def obtener_ultimos_partidos_equipo(team_id: str, es_local: bool, fecha_hasta: s
     return filtrados[:MAX_PARTIDOS_HISTORICO]
 
 
+@functools.lru_cache(maxsize=512)
 def obtener_estadisticas_partido(match_id: str) -> Dict[str, Any]:
     """
-    Consulta /football/matches/{match_id}/stats.
+    Consulta /football/matches/{match_id}/stats con caché LRU.
+    Si dos equipos comparten un partido histórico, solo se pide una vez.
     """
     data = api_get(f"/football/matches/{match_id}/stats")
     return data.get("data", {})
@@ -198,27 +264,30 @@ def obtener_estadisticas_partido(match_id: str) -> Dict[str, Any]:
 
 def extraer_stat_equipo(stats_data: Dict[str, Any], team_id: str, match_obj: Dict[str, Any], stat_key: str) -> float:
     """
-    Extrae un valor numérico de estadísticas de partido para un equipo específico.
-    Maneja de forma segura nodos None o faltantes.
+    Extrae un valor numérico de estadísticas para un equipo específico.
+    Maneja de forma segura nodos None, diccionarios vacíos o tipos inesperados.
     """
     if not stats_data or not match_obj:
         return 0.0
 
-    home_team_id = match_obj.get("home_team", {}).get("id")
-    away_team_id = match_obj.get("away_team", {}).get("id")
+    home_id = match_obj.get("home_team", {}).get("id")
+    away_id = match_obj.get("away_team", {}).get("id")
 
-    overview = stats_data.get("overview") or {}
+    overview = stats_data.get("overview")
+    if not overview or not isinstance(overview, dict):
+        return 0.0
+
     stat_node = overview.get(stat_key)
-    if stat_node is None:
+    if stat_node is None or not isinstance(stat_node, dict):
         return 0.0
 
     all_vals = stat_node.get("all")
     if not all_vals or not isinstance(all_vals, dict):
         return 0.0
 
-    if team_id == home_team_id:
+    if team_id == home_id:
         raw = all_vals.get("home")
-    elif team_id == away_team_id:
+    elif team_id == away_id:
         raw = all_vals.get("away")
     else:
         return 0.0
@@ -297,8 +366,8 @@ def procesar_partido(match_obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     fecha_hasta = match_obj.get("utc_date", datetime.now(timezone.utc).isoformat())[:10]
 
-    partidos_local_casa = obtener_ultimos_partidos_equipo(home_id, es_local=True, fecha_hasta=fecha_hasta)
-    partidos_visitante_fuera = obtener_ultimos_partidos_equipo(away_id, es_local=False, fecha_hasta=fecha_hasta)
+    partidos_local_casa = obtener_ultimos_partidos_equipo(home_id, True, fecha_hasta)
+    partidos_visitante_fuera = obtener_ultimos_partidos_equipo(away_id, False, fecha_hasta)
 
     if len(partidos_local_casa) < 5 or len(partidos_visitante_fuera) < 5:
         logging.warning(
@@ -362,22 +431,13 @@ def procesar_partido(match_obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     lineas_goles_combinado = evaluar_lineas_seguras(goles_totales_combinado, UMBRALES_GOLES_TOTALES)
 
     # ── Ensamblaje del nodo JSON ──
-    nodo = {
+    return {
         "match_id": match_id,
         "fecha": fecha,
         "hora_utc": match_obj.get("utc_date", ""),
-        "liga": {
-            "id": liga_id,
-            "season_id": season_id
-        },
-        "equipo_local": {
-            "id": home_id,
-            "nombre": home_team.get("name")
-        },
-        "equipo_visitante": {
-            "id": away_id,
-            "nombre": away_team.get("name")
-        },
+        "liga": {"id": liga_id, "season_id": season_id},
+        "equipo_local": {"id": home_id, "nombre": home_team.get("name")},
+        "equipo_visitante": {"id": away_id, "nombre": away_team.get("name")},
         "historial_condicionado": {
             "local_casa_muestras": len(partidos_local_casa),
             "visitante_fuera_muestras": len(partidos_visitante_fuera)
@@ -412,7 +472,6 @@ def procesar_partido(match_obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             }
         }
     }
-    return nodo
 
 
 def main():
