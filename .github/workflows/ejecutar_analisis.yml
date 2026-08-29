@@ -1,4 +1,4 @@
-name: Ejecutar Análisis Deportivo - API-Football v3
+name: Ejecutar Análisis Deportivo - TheStats API v1.0.0
 
 on:
   workflow_dispatch:
@@ -32,7 +32,7 @@ jobs:
 
       - name: Ejecutar analizador.py con API Key
         env:
-          APIFOOTBALL_KEY: ${{ secrets.APIFOOTBALL_KEY }}
+          THESTATS_API_KEY: ${{ secrets.THESTATS_API_KEY }}
         run: python analizador.py
 
       - name: Subir artefacto JSON resultante
