@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Motor de Análisis Deportivo - TheStats API v1.0.0
-Autor: Backend Senior
-Entorno: GitHub Actions / Cloud
+Versión corregida: Rate limiter proactivo + manejo robusto de None
 """
 
 import os
@@ -11,8 +10,9 @@ import sys
 import json
 import time
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Set
+from functools import wraps
 
 import requests
 import numpy as np
@@ -45,12 +45,15 @@ NOMBRES_LIGAS_ELITE = [
 
 MAX_PARTIDOS_DIA = 10
 MAX_PARTIDOS_HISTORICO = 10
-MAX_FIXTURES_POR_EQUIPO = 100
 MIN_TASA_SEGURA = 0.80
 
 UMBRALES_CORNERS = [2.5, 3.5, 4.5, 5.5, 6.5]
 UMBRALES_REMATES_ARCO = [2.5, 3.5, 4.5, 5.5]
 UMBRALES_GOLES_TOTALES = [1.5, 2.5, 3.5]
+
+# Rate limiter proactivo: máximo 1 petición cada 0.6s (~100/minuto)
+MIN_SEGUNDOS_ENTRE_CALLS = 0.6
+_ULTIMA_LLAMADA = [0.0]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,21 +63,32 @@ logging.basicConfig(
 
 
 # ─────────────────────────────────────────────────────────────
-# CAPA DE COMUNICACIÓN HTTP
+# CAPA DE COMUNICACIÓN HTTP CON RATE LIMITER PROACTIVO
 # ─────────────────────────────────────────────────────────────
+
+def _rate_limit():
+    """Espera activa para no exceder el límite de tasa de la API."""
+    ahora = time.time()
+    transcurrido = ahora - _ULTIMA_LLAMADA[0]
+    if transcurrido < MIN_SEGUNDOS_ENTRE_CALLS:
+        sleep_time = MIN_SEGUNDOS_ENTRE_CALLS - transcurrido
+        time.sleep(sleep_time)
+    _ULTIMA_LLAMADA[0] = time.time()
+
 
 def api_get(endpoint: str, params: Dict[str, Any] = None, max_retries: int = 3) -> Dict[str, Any]:
     """
-    Ejecuta una petición GET autenticada a TheStats API con reintentos
-    exponenciales y manejo de errores.
+    Ejecuta una petición GET autenticada a TheStats API con rate limiter
+    proactivo y reintentos exponenciales ante 429.
     """
     url = f"{BASE_URL}{endpoint}"
     for intento in range(1, max_retries + 1):
         try:
+            _rate_limit()
             resp = requests.get(url, headers=HEADERS, params=params, timeout=30)
             if resp.status_code == 429:
                 espera = 2 ** intento
-                logging.warning(f"Rate limit alcanzado. Esperando {espera}s...")
+                logging.warning(f"Rate limit 429 en {url}. Backoff {espera}s (intento {intento})")
                 time.sleep(espera)
                 continue
             resp.raise_for_status()
@@ -86,15 +100,14 @@ def api_get(endpoint: str, params: Dict[str, Any] = None, max_retries: int = 3) 
             logging.warning(f"Intento {intento}/{max_retries} fallido en {url}: {exc}")
             if intento == max_retries:
                 logging.error(f"Agotados reintentos para {url}")
-                raise
+                return {}
             time.sleep(1.5 ** intento)
     return {}
 
 
 def api_get_all_pages(endpoint: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Itera automáticamente todas las páginas de una respuesta paginada
-    y devuelve el array completo de objetos 'data'.
+    Itera automáticamente todas las páginas de una respuesta paginada.
     """
     todos = []
     pagina = 1
@@ -109,7 +122,6 @@ def api_get_all_pages(endpoint: str, params: Dict[str, Any]) -> List[Dict[str, A
         if pagina >= meta.get("total_pages", 1):
             break
         pagina += 1
-        time.sleep(0.4)
     return todos
 
 
@@ -128,11 +140,9 @@ def resolver_ids_competiciones() -> Set[str]:
     mapeo_nombres = {c["name"].lower(): c["id"] for c in competiciones}
     for nombre in NOMBRES_LIGAS_ELITE:
         nombre_lower = nombre.lower()
-        # Búsqueda exacta primero
         if nombre_lower in mapeo_nombres:
             ids.add(mapeo_nombres[nombre_lower])
             continue
-        # Búsqueda parcial como fallback
         for comp in competiciones:
             if nombre_lower in comp["name"].lower():
                 ids.add(comp["id"])
@@ -147,46 +157,33 @@ def resolver_ids_competiciones() -> Set[str]:
 
 def obtener_partidos_del_dia(fecha_str: str, ids_ligas: Set[str]) -> List[Dict[str, Any]]:
     """
-    Consulta /football/matches?date_from={fecha}&date_to={fecha}&status=scheduled
-    y filtra únicamente partidos pertenecientes a las ligas élite resueltas.
+    Consulta /football/matches filtrando por fecha y status=scheduled.
     """
     partidos = api_get_all_pages("/football/matches", {
         "date_from": fecha_str,
         "date_to": fecha_str,
         "status": "scheduled"
     })
-    filtrados = []
-    for p in partidos:
-        comp_id = p.get("competition_id")
-        if comp_id in ids_ligas:
-            filtrados.append(p)
+    filtrados = [p for p in partidos if p.get("competition_id") in ids_ligas]
     return filtrados[:MAX_PARTIDOS_DIA]
 
 
 def obtener_ultimos_partidos_equipo(team_id: str, es_local: bool, fecha_hasta: str) -> List[Dict[str, Any]]:
     """
-    Consulta /football/matches?team_id={team_id}&status=finished&date_to={fecha_hasta}.
-    Filtra exactamente los últimos 10 partidos finalizados donde el equipo jugó
-    en casa (es_local=True) o fuera (es_local=False).
+    Consulta /football/matches?team_id={id}&status=finished&date_to={fecha}.
+    Filtra los últimos 10 partidos finalizados según condición local/visitante.
     """
     partidos = api_get_all_pages("/football/matches", {
         "team_id": team_id,
         "status": "finished",
         "date_to": fecha_hasta
     })
-    # Ordenar por fecha descendente (más reciente primero)
-    partidos_ordenados = sorted(
-        partidos,
-        key=lambda x: x.get("utc_date", ""),
-        reverse=True
-    )
+    partidos_ordenados = sorted(partidos, key=lambda x: x.get("utc_date", ""), reverse=True)
     filtrados = []
     for p in partidos_ordenados:
-        home_id = p.get("home_team", {}).get("id")
-        away_id = p.get("away_team", {}).get("id")
-        if es_local and home_id == team_id:
+        if es_local and p.get("home_team", {}).get("id") == team_id:
             filtrados.append(p)
-        elif not es_local and away_id == team_id:
+        elif not es_local and p.get("away_team", {}).get("id") == team_id:
             filtrados.append(p)
     return filtrados[:MAX_PARTIDOS_HISTORICO]
 
@@ -194,7 +191,6 @@ def obtener_ultimos_partidos_equipo(team_id: str, es_local: bool, fecha_hasta: s
 def obtener_estadisticas_partido(match_id: str) -> Dict[str, Any]:
     """
     Consulta /football/matches/{match_id}/stats.
-    Devuelve el nodo 'data' completo con las estadísticas del partido.
     """
     data = api_get(f"/football/matches/{match_id}/stats")
     return data.get("data", {})
@@ -203,8 +199,7 @@ def obtener_estadisticas_partido(match_id: str) -> Dict[str, Any]:
 def extraer_stat_equipo(stats_data: Dict[str, Any], team_id: str, match_obj: Dict[str, Any], stat_key: str) -> float:
     """
     Extrae un valor numérico de estadísticas de partido para un equipo específico.
-    Dado que las stats vienen en pares home/away, determina si el equipo
-    jugó como local o visitante en ese partido y extrae el valor correcto.
+    Maneja de forma segura nodos None o faltantes.
     """
     if not stats_data or not match_obj:
         return 0.0
@@ -212,9 +207,14 @@ def extraer_stat_equipo(stats_data: Dict[str, Any], team_id: str, match_obj: Dic
     home_team_id = match_obj.get("home_team", {}).get("id")
     away_team_id = match_obj.get("away_team", {}).get("id")
 
-    overview = stats_data.get("overview", {})
-    stat_node = overview.get(stat_key, {})
-    all_vals = stat_node.get("all", {})
+    overview = stats_data.get("overview") or {}
+    stat_node = overview.get(stat_key)
+    if stat_node is None:
+        return 0.0
+
+    all_vals = stat_node.get("all")
+    if not all_vals or not isinstance(all_vals, dict):
+        return 0.0
 
     if team_id == home_team_id:
         raw = all_vals.get("home")
@@ -236,9 +236,6 @@ def extraer_stat_equipo(stats_data: Dict[str, Any], team_id: str, match_obj: Dic
 # ─────────────────────────────────────────────────────────────
 
 def calcular_frecuencia(array_valores: List[float], umbral: float) -> float:
-    """
-    Calcula la tasa de cumplimiento de un umbral sobre un array de valores reales.
-    """
     if not array_valores:
         return 0.0
     cumplen = sum(1 for v in array_valores if v > umbral)
@@ -246,9 +243,6 @@ def calcular_frecuencia(array_valores: List[float], umbral: float) -> float:
 
 
 def evaluar_lineas_seguras(valores: List[float], umbrales: List[float]) -> List[Dict[str, Any]]:
-    """
-    Evalúa cada umbral. Si la tasa de cumplimiento es >= 80%, se cataloga como 'Segura'.
-    """
     lineas = []
     for umbral in umbrales:
         tasa = calcular_frecuencia(valores, umbral)
@@ -261,16 +255,12 @@ def evaluar_lineas_seguras(valores: List[float], umbrales: List[float]) -> List[
 
 
 def analizar_mercado_goles_y_btts(partidos: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Extrae goles totales y BTTS de los matches ya obtenidos (sin llamada adicional).
-    """
     goles_totales = []
     btts_si = 0
     for p in partidos:
-        score = p.get("score", {}) or {}
+        score = p.get("score") or {}
         home_goals = score.get("home")
         away_goals = score.get("away")
-        # Para partidos finished, score debe tener valores numéricos
         if home_goals is None or away_goals is None:
             continue
         total = home_goals + away_goals
@@ -293,11 +283,7 @@ def analizar_mercado_goles_y_btts(partidos: List[Dict[str, Any]]) -> Dict[str, A
 # ORQUESTADOR PRINCIPAL
 # ─────────────────────────────────────────────────────────────
 
-def procesar_partido(match_obj: Dict[str, Any], ids_ligas: Set[str]) -> Optional[Dict[str, Any]]:
-    """
-    Procesa un único partido del día: extrae historial condicionado,
-    estadísticas de rendimiento, goles, BTTS y genera el nodo JSON.
-    """
+def procesar_partido(match_obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     match_id = match_obj.get("id")
     fecha = match_obj.get("utc_date", "")[:10]
     liga_id = match_obj.get("competition_id")
@@ -309,15 +295,16 @@ def procesar_partido(match_obj: Dict[str, Any], ids_ligas: Set[str]) -> Optional
 
     logging.info(f"Procesando partido {match_id}: {home_team.get('name')} vs {away_team.get('name')}")
 
-    # ── Extracción de historial condicionado ──
-    # Usamos la fecha del partido como límite superior para no incluir partidos futuros
     fecha_hasta = match_obj.get("utc_date", datetime.now(timezone.utc).isoformat())[:10]
 
     partidos_local_casa = obtener_ultimos_partidos_equipo(home_id, es_local=True, fecha_hasta=fecha_hasta)
     partidos_visitante_fuera = obtener_ultimos_partidos_equipo(away_id, es_local=False, fecha_hasta=fecha_hasta)
 
     if len(partidos_local_casa) < 5 or len(partidos_visitante_fuera) < 5:
-        logging.warning(f"Datos insuficientes para {match_id}. Se requieren mínimo 5 partidos históricos por bando.")
+        logging.warning(
+            f"Datos insuficientes para {match_id}. "
+            f"Local: {len(partidos_local_casa)} muestras, Visitante: {len(partidos_visitante_fuera)} muestras."
+        )
         return None
 
     # ── Recolección de estadísticas de rendimiento ──
@@ -331,7 +318,6 @@ def procesar_partido(match_obj: Dict[str, Any], ids_ligas: Set[str]) -> Optional
         corners_local.append(extraer_stat_equipo(stats, home_id, p, "corner_kicks"))
         remates_arco_local.append(extraer_stat_equipo(stats, home_id, p, "shots_on_target"))
         tarjetas_local.append(extraer_stat_equipo(stats, home_id, p, "yellow_cards"))
-        time.sleep(0.3)
 
     corners_visitante = []
     remates_arco_visitante = []
@@ -343,7 +329,6 @@ def procesar_partido(match_obj: Dict[str, Any], ids_ligas: Set[str]) -> Optional
         corners_visitante.append(extraer_stat_equipo(stats, away_id, p, "corner_kicks"))
         remates_arco_visitante.append(extraer_stat_equipo(stats, away_id, p, "shots_on_target"))
         tarjetas_visitante.append(extraer_stat_equipo(stats, away_id, p, "yellow_cards"))
-        time.sleep(0.3)
 
     # ── Cálculo de promedios reales ──
     promedio_corners_local = round(np.mean(corners_local), 2) if corners_local else 0.0
@@ -362,14 +347,13 @@ def procesar_partido(match_obj: Dict[str, Any], ids_ligas: Set[str]) -> Optional
     lineas_corners = evaluar_lineas_seguras(corners_local + corners_visitante, UMBRALES_CORNERS)
     lineas_remates = evaluar_lineas_seguras(remates_arco_local + remates_arco_visitante, UMBRALES_REMATES_ARCO)
 
-    # ── Mercado de Goles y BTTS (usando datos de matches ya cargados) ──
+    # ── Mercado de Goles y BTTS ──
     goles_btts_local = analizar_mercado_goles_y_btts(partidos_local_casa)
     goles_btts_visitante = analizar_mercado_goles_y_btts(partidos_visitante_fuera)
 
-    # Combinado: goles totales de ambos conjuntos históricos
     goles_totales_combinado = []
     for p in partidos_local_casa + partidos_visitante_fuera:
-        score = p.get("score", {}) or {}
+        score = p.get("score") or {}
         hg = score.get("home")
         ag = score.get("away")
         if hg is not None and ag is not None:
@@ -435,7 +419,6 @@ def main():
     hoy_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     logging.info(f"Iniciando análisis para fecha: {hoy_utc}")
 
-    # Resolución dinámica de IDs de competiciones élite
     ids_ligas = resolver_ids_competiciones()
     if not ids_ligas:
         logging.error("No se pudieron resolver las competiciones élite. Abortando.")
@@ -450,13 +433,10 @@ def main():
         resultado_final = []
         for idx, partido in enumerate(partidos_dia, start=1):
             logging.info(f"[{idx}/{len(partidos_dia)}] Analizando match...")
-            nodo = procesar_partido(partido, ids_ligas)
+            nodo = procesar_partido(partido)
             if nodo:
                 resultado_final.append(nodo)
-            # Pausa respetuosa entre partidos para no saturar la API
-            time.sleep(1.0)
 
-    # ── Exportación del JSON de salida ──
     salida = {
         "meta": {
             "fecha_generacion": datetime.now(timezone.utc).isoformat(),
